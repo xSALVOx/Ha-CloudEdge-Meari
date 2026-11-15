@@ -138,17 +138,17 @@ def build_ice_binding_request(
 ) -> bytes:
     """Build an ICE STUN binding request with PRIORITY / ICE-CONTROLLING."""
     username = f"{remote_ufrag}:{local_ufrag}"
-    attrs = _encode_attr(ATTR_USERNAME, username.encode())
-    attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
-    attrs += _encode_attr(
-        0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big"))
-    )
+    attrs = _encode_attr(0x0024, struct.pack(">I", 0xFFFFFF7E))
     if use_candidate:
         attrs += _encode_attr(0x0025, b"")
+    attrs += _encode_attr(0x802A, b"\x00" * 8)
+    attrs += _encode_attr(0x8022, b"xts-ice-1.0.0")
+    attrs += _encode_attr(ATTR_USERNAME, remote_ufrag.encode())
+    attrs += _encode_attr(ATTR_USERNAME, username.encode())
     txn_id = os.urandom(12)
     attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, remote_pwd.encode())
-    msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
-    return msg
+    # APP-STYLE: niente FINGERPRINT, come l'app ufficiale
+    return struct.pack(">HHI", BINDING_REQUEST, len(attrs), MAGIC_COOKIE) + txn_id + attrs
 
 
 def close_socket(sock) -> None:

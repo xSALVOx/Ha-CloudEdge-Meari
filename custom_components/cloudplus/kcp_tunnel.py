@@ -55,7 +55,7 @@ VVP_FRAME_TYPES = {0xF9, 0xFA, 0xFC, 0xFD, 0xFE}
 _LOGGER = logging.getLogger(__name__)
 
 
-def _build_iva_frame(type_marker, data, session_id1=None, session_id2=None):
+def _build_iva_frame(type_marker, data, session_id1=None, session_id2=None, flags=0):
     """Build an IVA frame with given type and optional data.
 
     The session IDs (at offsets 4 and 8) must be consistent within a session.
@@ -71,7 +71,7 @@ def _build_iva_frame(type_marker, data, session_id1=None, session_id2=None):
         0,
         session_id1,
         session_id2,
-        0,
+        flags,  # APP-STYLE
         type_marker,
         len(data),
     )
@@ -296,12 +296,16 @@ class KcpTunnel:
 
     def send_handshake(self):
         """Send IVA handshake frame wrapped in KCP PUSH segment."""
-        frame = build_iva_handshake()
+        self._iva_ids = (  # APP-STYLE: stessi ID per tutta la sessione
+            int.from_bytes(os.urandom(4), "little") & 0x0FFFFFFF,
+            int.from_bytes(os.urandom(4), "little") & 0x0FFFFFFF,
+        )
+        frame = _build_iva_frame(IVA_TYPE_HANDSHAKE, b"", *self._iva_ids, flags=0x0200)
         self.send_data(frame)
 
     def wrap_iva(self, data):
         """Wrap data in an IVA data frame like the official app."""
-        return build_iva_data_frame(data)
+        return build_iva_data_frame(data, *(getattr(self, "_iva_ids", None) or (None, None)))  # APP-STYLE
 
     def send_data(self, data):
         """Send data through KCP. Handles fragmentation if needed."""

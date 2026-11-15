@@ -850,23 +850,131 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
             self._last_p2p_audio_time = time.monotonic()
             self._muxer.write_audio(payload)
 
-        def _worker() -> None:
+        def _new_streamer(video_cb, audio_cb, uuid_override=None):
             streamer = P2PStreamer(
                 api=self._api,
                 device=self._device,
-                on_video=on_video,
-                on_audio=on_audio,
+                on_video=video_cb,
+                on_audio=audio_cb,
                 on_login=lambda: None,
                 on_disconnect=lambda: None,
                 vvp_quality=self._stream_quality(),
                 video_password=self._video_password,
                 client_id=self.get_iot_value(1),
             )
-            self._p2p_streamer = streamer
+            if uuid_override:
+                streamer._client_uuid = uuid_override
+            return streamer
+
+        def _worker() -> None:  # APP-STYLE staffetta
+            import hashlib
+
+            lock = threading.Lock()
+            state = {"active": 0, "pending": None, "first": {}, "stop": False}
+            streamers: dict[int, Any] = {}
+            threads: dict[int, threading.Thread] = {}
+            uuids: list[str | None] = [None, None]
+
+            def callbacks(slot):
+                def video_cb(payload: bytes, timestamp_ms: int | None = None) -> None:
+                    now = time.monotonic()
+                    switched = False
+                    with lock:
+                        state["first"].setdefault(slot, now)
+                        if slot != state["active"]:
+                            if slot != state["pending"] or not is_keyframe(
+                                detect_codec(payload, default=self._video_codec), payload
+                            ):
+                                return
+                            state["active"] = slot
+                            state["pending"] = None
+                            switched = True
+                    if switched:
+                        _LOGGER.warning("APP-STYLE staffetta: passo alla sessione %d", slot)
+                        self._p2p_streamer = proxy
+                        self._reset_live_mux_timing()
+                    on_video(payload, timestamp_ms)
+
+                def audio_cb(payload: bytes) -> None:
+                    if slot == state["active"]:
+                        on_audio(payload)
+
+                return video_cb, audio_cb
+
+            slot_uuid: dict[int, str] = {}
+
+            def launch(slot: int) -> None:
+                video_cb, audio_cb = callbacks(slot)
+                other = None
+                if uuids[0] is not None:
+                    # sempre l'identita' diversa da quella della sessione attiva
+                    other = uuids[1] if slot_uuid.get(state["active"]) == uuids[0] else uuids[0]
+                streamer = _new_streamer(video_cb, audio_cb, other)
+                if uuids[0] is None:
+                    uuids[0] = streamer._client_uuid
+                    uuids[1] = hashlib.md5((uuids[0] + "-b").encode()).hexdigest()[:16]
+                slot_uuid[slot] = streamer._client_uuid
+                streamers[slot] = streamer
+                thread = threading.Thread(target=streamer.run_session, daemon=True)
+                threads[slot] = thread
+                thread.start()
+
+            class _Proxy:
+                def request_stop(self_inner) -> None:
+                    state["stop"] = True
+                    for streamer in list(streamers.values()):
+                        streamer.request_stop()
+
+                def __getattr__(self_inner, name):
+                    return getattr(streamers[state["active"]], name)
+
+            proxy = _Proxy()
+            launch(0)
+            self._p2p_streamer = proxy
+            next_slot = 1
+            pending_since = 0.0
             try:
-                streamer.run_session()
+                while not state["stop"]:
+                    now = time.monotonic()
+                    with lock:
+                        active = state["active"]
+                        pending = state["pending"]
+                        first = state["first"].get(active)
+                    if pending is not None:
+                        if not threads[pending].is_alive() or now - pending_since > 25.0:
+                            _LOGGER.warning("APP-STYLE staffetta: sessione %d senza video", pending)
+                            streamers[pending].request_stop()
+                            with lock:
+                                if state["pending"] == pending:
+                                    state["pending"] = None
+                            continue
+                    if not threads[active].is_alive():
+                        if pending is not None:
+                            time.sleep(0.05)
+                            continue
+                        break
+                    if (
+                        pending is None
+                        and not grab_only
+                        and first is not None
+                        and now - first >= 100.0
+                        and stream_allowed()
+                    ):
+                        _LOGGER.warning("APP-STYLE staffetta: apro la sessione %d", next_slot)
+                        with lock:
+                            state["pending"] = next_slot
+                        pending_since = now
+                        launch(next_slot)
+                        next_slot += 1
+                    time.sleep(0.1)
             finally:
-                self._last_p2p_diagnostics = streamer.diagnostics
+                state["stop"] = True
+                for slot, streamer in streamers.items():
+                    if threads[slot].is_alive():
+                        streamer.request_stop()
+                active_streamer = streamers.get(state["active"])
+                if active_streamer is not None:
+                    self._last_p2p_diagnostics = active_streamer.diagnostics
                 self._p2p_streamer = None
 
         self._stream_thread = threading.Thread(target=_worker, daemon=True)

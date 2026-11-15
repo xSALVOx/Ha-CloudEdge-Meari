@@ -84,6 +84,15 @@ class LiveSessionMixin:
         fire_wake: Callable[[], None] | None = None,
     ) -> tuple[int, int]:
         local_ips = _get_local_ips()
+        if not self._remote:  # APP-STYLE: metti per primo l'IP della rete di casa
+            try:
+                _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                _s.connect(("8.8.8.8", 80))
+                _lan_ip = _s.getsockname()[0]
+                _s.close()
+                local_ips = [_lan_ip] + [ip for ip in local_ips if ip != _lan_ip]
+            except OSError:
+                pass
         ice_ufrag = os.urandom(4).hex()
         ice_pwd = os.urandom(12).hex()
 
@@ -108,12 +117,21 @@ class LiveSessionMixin:
                 )
         offer_tag = str((sig.webrtcsvr or {}).get("tag") or "") + "01"
         offer_sdp = "\n".join(sdp_lines) + "\n"
+        _LOGGER.debug("APP-STYLE offer SDP: %s", offer_sdp.replace("\n", " | "))
         if was_dormant:
             camera_ufrag, camera_pwd, camera_candidates = self._negotiate_dormant_offer(
                 sig, device_uuid, offer_sdp, fire_wake
             )
         else:
             answer = sig.send_offer(device_uuid, offer_sdp)
+            if (  # APP-STYLE 15
+                isinstance(answer, dict)
+                and answer.get("action") == "status"
+                and not answer.get("sdp")
+            ):
+                raise RuntimeError(
+                    f"camera status {answer.get('status')!r} instead of SDP answer"
+                )
             camera_ufrag, camera_pwd, camera_candidates = parse_sdp_answer(
                 answer.get("sdp", "")
             )
@@ -144,11 +162,14 @@ class LiveSessionMixin:
             if cand.get("ip"):
                 permission_ips.add(cand["ip"])
 
+        _relay_ips = {c.get("ip") for c in camera_candidates if c.get("type") == "relay"}
         for ip in permission_ips:
-            if ip:
+            if ip and (self._remote or ip in _relay_ips):  # APP-STYLE
                 turn.create_permission(ip)
         for cand in camera_candidates:
             if cand.get("ip") and cand.get("port"):
+                if not self._remote and cand.get("type") != "relay":  # APP-STYLE
+                    continue
                 turn.channel_bind(cand["ip"], cand["port"])
 
         probe_hosts = []
@@ -195,6 +216,13 @@ class LiveSessionMixin:
         candidate_fanout_until = time.time() + 8.0
 
         def _send_udp(data: bytes) -> None:
+            if not self._remote and direct_ice_peer[0] is not None:  # APP-STYLE
+                peer_ip, peer_port = direct_ice_peer[0]
+                try:
+                    turn.send_direct(peer_ip, peer_port, data)
+                    return
+                except OSError:
+                    pass
             if confirmed_peer[0] is None and direct_ice_peer[0] is not None:
                 try:
                     peer_ip, peer_port = direct_ice_peer[0]
@@ -337,6 +365,19 @@ class LiveSessionMixin:
                     continue
                 if cand.get("type") == "relay":
                     continue
+                if not self._remote:  # APP-STYLE: in LAN solo check diretti
+                    try:
+                        _send_direct_ice_binding(
+                            turn.open_socket(),
+                            cand["ip"],
+                            cand["port"],
+                            ice_ufrag,
+                            camera_ufrag,
+                            camera_pwd,
+                        )
+                    except OSError:
+                        pass
+                    continue
                 try:
                     turn.send_ice_binding(
                         cand["ip"],
@@ -474,6 +515,10 @@ class LiveSessionMixin:
                     idle_reconnect_s = max(
                         idle_reconnect_s, DIRECT_SOURCE_IDLE_RECONNECT_S
                     )
+                if live_started_at > 0.0 and time.time() - live_started_at >= 110.0:
+                    idle_reconnect_s = min(idle_reconnect_s, 1.5)  # APP-STYLE
+                if not self._remote and udp_idle >= 4.0:
+                    idle_reconnect_s = min(idle_reconnect_s, 4.0)  # APP-STYLE 13
                 if stall_time >= idle_reconnect_s and not kcp_pending:
                     _LOGGER.warning(
                         "P2P source idle %.1fs; reconnecting session",
@@ -538,6 +583,8 @@ class LiveSessionMixin:
             if parsed:
                 msg_type = parsed.get("type")
                 if msg_type == BINDING_REQUEST and peer is not None:
+                    if packet.via_turn and not self._remote:  # APP-STYLE
+                        return
                     if not packet.via_turn and not self._remote:
                         direct_ice_peer[0] = peer
                     try:
@@ -613,7 +660,7 @@ class LiveSessionMixin:
         def _seek_direct_ice_before_startup() -> None:
             if self._remote or not lan_connect_endpoints:
                 return
-            deadline = time.time() + DIRECT_STARTUP_ICE_GRACE_S
+            deadline = time.time() + max(DIRECT_STARTUP_ICE_GRACE_S, 1.5)  # APP-STYLE 14
             while (
                 self._running and direct_ice_peer[0] is None and time.time() < deadline
             ):
@@ -630,6 +677,17 @@ class LiveSessionMixin:
 
         now = time.time()
         _seek_direct_ice_before_startup()
+        if not self._remote and lan_connect_endpoints and direct_ice_peer[0] is None:
+            _LOGGER.warning("APP-STYLE no LAN answer in 1.5 s; retrying session")  # APP-STYLE 14
+            return (self._video_count, self._total_bytes)
+        turn_released = False
+        if not self._remote and direct_ice_peer[0] is not None:  # APP-STYLE
+            try:
+                turn.refresh(lifetime=0)
+            except OSError:
+                pass
+            turn_released = True
+            _LOGGER.debug("APP-STYLE TURN relay released, LAN peer %s", direct_ice_peer[0])
         now = time.time()
         _send_lan_connect(now, force=True)
         kcp.send_handshake()
@@ -707,7 +765,7 @@ class LiveSessionMixin:
                     wait_for_recovery_keyframe=True,
                 )
 
-            if now >= turn_refresh:
+            if now >= turn_refresh and not turn_released:  # APP-STYLE
                 try:
                     turn.refresh()
                 except OSError:

@@ -134,7 +134,7 @@ class StreamServer:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind(("0.0.0.0", 0))
+                sock.bind(("127.0.0.1", 0))  # APP-STYLE 16: solo dal PC stesso
                 sock.listen(8)
                 sock.settimeout(1.0)
             except OSError:
